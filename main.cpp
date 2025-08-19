@@ -5,8 +5,6 @@
 #include <iostream>
 #include "ftpd_cpm.h"
 
-/* Buffer */
-#define ETHERNET_BUF_MAX_SIZE (1024 * 16)
 
 /* FTP */
 static uint8_t g_ftp_buf[ETHERNET_BUF_MAX_SIZE] = {

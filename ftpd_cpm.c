@@ -115,7 +115,7 @@ FRESULT scan_files_cpm(char* path, char* buf1, int* buf_len)
 		++file_cnt;
 		cpmNamei(&root, dirent.name, &file);
 		cpmStat(&file, &statbuf);
-		fno.fsize = (long)(statbuf.size);// +bufStat.f_bsize - 1) / bufStat.f_bsize * bufStat.f_bsize;
+		fno.fsize = statbuf.size;// +bufStat.f_bsize - 1) / bufStat.f_bsize * (bufStat.f_bsize / 1024));
 		temp_dir = '-';
 		fno.fdate = temp_f_date;
 		fno.ftime = temp_f_time;
@@ -193,7 +193,7 @@ struct SOCKSTATES
 	enum TCP_STATE5500 state;
 } states[2] = { {1,SOCK_CLOSED}, {2, SOCK_CLOSED} };
 
-int getClosedIndex(SOCKET s);
+SOCKET getClosedIndex(SOCKET s);
 
 enum TCP_STATE5500 getSn_SR(SOCKET s)
 {
@@ -219,7 +219,7 @@ enum TCP_STATE5500 getSn_SR(SOCKET s)
 	}
 	return (enum TCP_STATE5500)tcp_info.State;
 #endif
-	int s_closed = getClosedIndex(s);
+	SOCKET s_closed = getClosedIndex(s);
 	struct SOCKSTATES* pState = NULL;
 	for (int i = 0; i < 2; ++i)
 		if (states[i].sock == s || states[i].sock == s_closed)
@@ -239,7 +239,7 @@ enum TCP_STATE5500 getSn_SR(SOCKET s)
 
 void replaceSocketState(SOCKET s, enum TCP_STATE5500 newState)
 {
-	int s_closed = getClosedIndex(s);
+	SOCKET s_closed = getClosedIndex(s);
 	for (int i = 0; i < 2; ++i)
 		if (states[i].sock == s || states[i].sock == s_closed)
 		{
@@ -293,7 +293,7 @@ int disconnect(SOCKET s)
 	return res;
 }
 
-int getClosedIndex(SOCKET s)
+SOCKET getClosedIndex(SOCKET s)
 {
 	if (s < 3)
 		return s;
@@ -400,7 +400,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 {
 	int size = 0;
 	long ret = 0;
-	uint32_t remain_datasize;
+	int32_t remain_datasize;
 
 	// memset(dbuf, 0, sizeof(_MAX_SS));
 
@@ -643,10 +643,10 @@ long ftpd_cpm_run(uint8_t* dbuf)
 						{
 							//memset(dbuf, 0, _MAX_SS);
 
-							//if (remain_datasize > _MAX_SS)
-							//	recv_byte = _MAX_SS;
-							//else
 							int received = remain_datasize;
+							if (remain_datasize > ETHERNET_BUF_MAX_SIZE)
+								received = ETHERNET_BUF_MAX_SIZE;
+							//else
 							received = recv(DATA_SOCK_CPM, dbuf, received, 0);
 							ftp.fr = cpmWrite(&file, dbuf, received) != received ? 1 : 0;
 #if defined(_FTP_DEBUG_)
@@ -827,8 +827,17 @@ long ftpd_cpm_run(uint8_t* dbuf)
 
 void toCpmName(char cpmname[15], const char* filename)
 {
-	strncpy(cpmname, "00", 2);
-	strcpy(cpmname + 2, filename);
+	strcpy(cpmname, "00");
+	const char* pDot = strchr(filename, '.');
+	int len = min(8, pDot ? pDot - filename : strlen(filename));
+	strncpy(cpmname + 2, filename, len);
+	cpmname[2 + len] = 0;
+	if (pDot)
+	{
+		strcat(cpmname, ".");
+		strncpy(cpmname + 2 + 1 + len, pDot + 1, 3);
+		cpmname[2 + 1 + len + 3] = 0;
+	}
 }
 
 inline int strlen_i(const char* arg)

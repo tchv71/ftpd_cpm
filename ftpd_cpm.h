@@ -5,6 +5,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+	/* Buffer */
+#define ETHERNET_BUF_MAX_SIZE (1024 * 16)
 
 /*
 * Wiznet.
