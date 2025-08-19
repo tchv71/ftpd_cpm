@@ -38,6 +38,8 @@ extern "C" {
 
 #define CTRL_SOCK_CPM	ftp.CTRL_SOCK
 #define DATA_SOCK_CPM	ftp.DATA_SOCK
+#define CTRL_SOCK_CLOSED	1
+#define DATA_SOCK_CLOSED	2
 
 #define	IPPORT_FTPD	20	/* FTP Data port */
 #define	IPPORT_FTP	21	/* FTP Control port */

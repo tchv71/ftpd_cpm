@@ -675,7 +675,7 @@ void cpmglob(int optin, int argc, char * const argv[], struct cpmInode *root, in
   free(dirent);
 }
 /*}}}*/
-#define DISKDEFS "DISKDEFS"
+#define DISKDEFS "../../diskdefs"
 /* superblock management */
 /* diskdefReadSuper   -- read super block from diskdefs file     */ /*{{{*/
 static int diskdefReadSuper(struct cpmSuperBlock *d, const char *format)

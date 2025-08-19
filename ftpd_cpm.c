@@ -32,6 +32,7 @@ static un_l2cval remote_ip;
 static uint16_t remote_port;
 static un_l2cval local_ip;
 static uint16_t local_port;
+static uint16_t local_port_old;
 static uint8_t connect_state_control = 0;
 static uint8_t connect_state_data = 0;
 
@@ -81,7 +82,7 @@ FRESULT unmount_drive()
 {
 	if (bMounted)
 	{
-		char* res = Device_close(&drive.dev);
+		const char* res = Device_close(&drive.dev);
 		cpmUmount(&drive);
 		bMounted = false;
 	}
@@ -190,7 +191,9 @@ struct SOCKSTATES
 {
 	SOCKET sock;
 	enum TCP_STATE5500 state;
-} states[2] = { {0,SOCK_CLOSED}, {0, SOCK_CLOSED} };
+} states[2] = { {1,SOCK_CLOSED}, {2, SOCK_CLOSED} };
+
+int getClosedIndex(SOCKET s);
 
 enum TCP_STATE5500 getSn_SR(SOCKET s)
 {
@@ -216,11 +219,10 @@ enum TCP_STATE5500 getSn_SR(SOCKET s)
 	}
 	return (enum TCP_STATE5500)tcp_info.State;
 #endif
-	if (s == 0)
-		return SOCK_INIT;
+	int s_closed = getClosedIndex(s);
 	struct SOCKSTATES* pState = NULL;
 	for (int i = 0; i < 2; ++i)
-		if (states[i].sock == 0 || states[i].sock == s)
+		if (states[i].sock == s || states[i].sock == s_closed)
 		{
 			states[i].sock = s;
 			pState = states + i;
@@ -229,31 +231,19 @@ enum TCP_STATE5500 getSn_SR(SOCKET s)
 
 	if (pState)
 	{
-		enum TCP_STATE5500 new_state = SOCK_ERROR;
-		enum TCP_STATE5500 state = pState->state;
-		enum TCP_STATE5500 state_trans[] = {
-			SOCK_CLOSED, SOCK_INIT,
-			SOCK_INIT, SOCK_ESTABLISHED,
-			SOCK_ESTABLISHED, SOCK_ESTABLISHED,
-		};
-		for (int i = 0; i < sizeof(state_trans) / sizeof(state_trans[0]) / 2; ++i)
-			if (state_trans[i * 2] == state)
-			{
-				new_state = state_trans[i * 2 + 1];
-				break;
-			}
-		pState->state = new_state;
-		return state;
+		return pState->state;
 	}
 	return SOCK_ERROR;
 }
 
-void replaceSocketState(SOCKET s_old, SOCKET s_new, enum TCP_STATE5500 newState)
+
+void replaceSocketState(SOCKET s, enum TCP_STATE5500 newState)
 {
+	int s_closed = getClosedIndex(s);
 	for (int i = 0; i < 2; ++i)
-		if (states[i].sock == s_old)
+		if (states[i].sock == s || states[i].sock == s_closed)
 		{
-			states[i].sock = s_new;
+			states[i].sock = newState == SOCK_CLOSED ? s_closed : s;
 			states[i].state = newState;
 			break;
 		}
@@ -277,35 +267,42 @@ void ftpd_cpm_init(uint8_t* src_ip)
 	local_ip.cVal[1] = src_ip[1];
 	local_ip.cVal[2] = src_ip[2];
 	local_ip.cVal[3] = src_ip[3];
-	local_port = 35000;
+	local_port_old = local_port = 35000;
 
 	strcpy(ftp.workingdir, "/");
 
-	//ftp.CTRL_SOCK = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
-	//ftp.DATA_SOCK = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	ftp.CTRL_SOCK = CTRL_SOCK_CLOSED;// WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, 0);
+	ftp.DATA_SOCK = DATA_SOCK_CLOSED;// socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 }
 
 #define SOCK_OK 0
 int disconnect(SOCKET s)
 {
 	int res = closesocket(s);
-	replaceSocketState(s, 0, SOCK_CLOSED);
+	replaceSocketState(s, SOCK_CLOSED);
 	if (s == DATA_SOCK_CPM)
 	{
-		DATA_SOCK_CPM = 0;
+		DATA_SOCK_CPM = DATA_SOCK_CLOSED;
 		remote_ip.lVal = 0;
 	}
 	if (s == CTRL_SOCK_CPM)
 	{
-		CTRL_SOCK_CPM = 0;
+		CTRL_SOCK_CPM = CTRL_SOCK_CLOSED;
 		unmount_drive();
 	}
 	return res;
 }
 
-int openDataSocket()
+int getClosedIndex(SOCKET s)
 {
-	ASSERT(DATA_SOCK_CPM == 0);
+	if (s < 3)
+		return s;
+	return s == CTRL_SOCK_CPM ? CTRL_SOCK_CLOSED : (s == DATA_SOCK_CPM ? DATA_SOCK_CLOSED : 0);
+}
+
+int connectSocket(SOCKET* ps)
+{
+	ASSERT(*ps < 3);
 	int iResult = 0;
 	struct addrinfo* result = NULL;
 	struct addrinfo hints;
@@ -320,33 +317,89 @@ int openDataSocket()
 	sprintf(portStr, "%d", (int)/*htons*/(remote_port));
 	char ipStr[24];
 	sprintf(ipStr, "%d.%d.%d.%d", remote_ip.cVal[0], remote_ip.cVal[1], remote_ip.cVal[2], remote_ip.cVal[3]);
-	iResult = getaddrinfo("127.0.0.1", portStr, &hints, &result);
+	iResult = getaddrinfo(ipStr, portStr, &hints, &result);
 	if (iResult != 0) {
+#if defined(_FTP_DEBUG_)
 		printf("getaddrinfo failed with error: %d\n", iResult);
-		WSACleanup();
-		return 1;
+#endif
+		return iResult;
 	}
 	// Create a SOCKET for the server to listen for client connections.
-	DATA_SOCK_CPM = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-	if (DATA_SOCK_CPM == INVALID_SOCKET)
+	*ps = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+	if (*ps == INVALID_SOCKET)
 	{
+#if defined(_FTP_DEBUG_)
 		printf("socket failed with error: %ld\n", WSAGetLastError());
+#endif
 		freeaddrinfo(result);
-		WSACleanup();
-		return 1;
+		return iResult;
 	}
-	iResult = connect(DATA_SOCK_CPM, result->ai_addr, (int)result->ai_addrlen);
+	iResult = connect(*ps, result->ai_addr, (int)result->ai_addrlen);
 	freeaddrinfo(result);
+	replaceSocketState(*ps, SOCK_ESTABLISHED);
 	return iResult;
 }
 
 #define send(s, buf, len) send(s, buf, len, 0)
 
+int listenSocket(SOCKET* ps, uint16_t port)
+{
+	int iResult = 0;
+	struct addrinfo* result = NULL;
+	struct addrinfo hints;
+	ZeroMemory(&hints, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+	hints.ai_flags = AI_PASSIVE;
+
+	// Resolve the server address and port
+	char portStr[16];
+	sprintf(portStr, "%d", (int)port);
+	iResult = getaddrinfo(NULL, portStr, &hints, &result);
+	if (iResult != 0) {
+#if defined(_FTP_DEBUG_)
+		printf("getaddrinfo failed with error: %d\n", iResult);
+#endif
+		return iResult;
+	}
+	// Create a SOCKET for the server to listen for client connections.
+	*ps = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+	if (*ps == INVALID_SOCKET)
+	{
+#if defined(_FTP_DEBUG_)
+		printf("socket failed with error: %ld\n", WSAGetLastError());
+#endif
+		freeaddrinfo(result);
+		return iResult;
+	}
+	iResult = bind(*ps, result->ai_addr, (int)result->ai_addrlen);
+	freeaddrinfo(result);
+	if (iResult != SOCK_OK)
+	{
+#if defined(_FTP_DEBUG_)
+		printf("%d:Bind error\r\n", (int)*ps);
+#endif
+		return iResult;
+	}
+	if ((iResult = listen(*ps, SOMAXCONN)) != SOCK_OK)
+	{
+#if defined(_FTP_DEBUG_)
+		printf("%d:Listen error\r\n", (int)*ps);
+#endif
+		return iResult;
+	}
+	SOCKET client = accept(*ps, NULL, NULL);
+	closesocket(*ps);
+	*ps = client;
+	replaceSocketState(*ps, SOCK_ESTABLISHED);
+	return 0;
+}
+
 long ftpd_cpm_run(uint8_t* dbuf)
 {
 	int size = 0;
 	long ret = 0;
-	uint32_t recv_byte;
 	uint32_t remain_datasize;
 
 	// memset(dbuf, 0, sizeof(_MAX_SS));
@@ -357,7 +410,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		if (!connect_state_control)
 		{
 #if defined(_FTP_DEBUG_)
-			printf("%d:FTP Connected\r\n", CTRL_SOCK_CPM);
+			printf("%d:FTP Connected\r\n", (int)CTRL_SOCK_CPM);
 #endif
 			// fsprintf(CTRL_SOCK_CPM, banner, HOSTNAME, VERSION);
 			strcpy(ftp.workingdir, "/");
@@ -366,7 +419,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 			if (ret < 0)
 			{
 #if defined(_FTP_DEBUG_)
-				printf("%d:send() error:%ld\r\n", CTRL_SOCK_CPM, ret);
+				printf("%d:send() error:%ld\r\n", (int)CTRL_SOCK_CPM, ret);
 #endif
 				disconnect(CTRL_SOCK_CPM);
 				return ret;
@@ -375,7 +428,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		}
 
 #if defined(_FTP_DEBUG_)
-		printf("ftp socket %d\r\n", CTRL_SOCK_CPM);
+		//printf("ftp socket %d\r\n", (int)CTRL_SOCK_CPM);
 #endif
 
 		if ((size = getSn_RX_RSR(CTRL_SOCK_CPM)) > 0) // Don't need to check SOCKERR_BUSY because it doesn't not occur.
@@ -398,7 +451,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 				if (ret < 0)
 				{
 #if defined(_FTP_DEBUG_)
-					printf("%d:recv() error:%ld\r\n", CTRL_SOCK_CPM, ret);
+					printf("%d:recv() error:%ld\r\n", (int)CTRL_SOCK_CPM, ret);
 #endif
 					disconnect(CTRL_SOCK_CPM);
 					return ret;
@@ -417,82 +470,52 @@ long ftpd_cpm_run(uint8_t* dbuf)
 
 	case SOCK_CLOSE_WAIT:
 #if defined(_FTP_DEBUG_)
-		printf("%d:CloseWait\r\n", CTRL_SOCK_CPM);
+		printf("%d:CloseWait\r\n", (int)CTRL_SOCK_CPM);
 #endif
 		if ((ret = disconnect(CTRL_SOCK_CPM)) != SOCK_OK)
 			return ret;
 #if defined(_FTP_DEBUG_)
-		printf("%d:Closed\r\n", CTRL_SOCK_CPM);
+		printf("%d:Closed\r\n", (int)CTRL_SOCK_CPM);
 #endif
 		break;
 
 	case SOCK_CLOSED:
 #if defined(_FTP_DEBUG_)
-		printf("%d:FTPStart\r\n", CTRL_SOCK_CPM);
+		printf("%d:FTPStart\r\n", (int)CTRL_SOCK_CPM);
 #endif
-		if ((CTRL_SOCK_CPM = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET/*socket(CTRL_SOCK_CPM, Sn_MR_TCP, IPPORT_FTP, 0x0)) != CTRL_SOCK_CPM*/)
+		if (false &&(CTRL_SOCK_CPM = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == INVALID_SOCKET/*socket(CTRL_SOCK_CPM, Sn_MR_TCP, IPPORT_FTP, 0x0)) != CTRL_SOCK_CPM*/)
 		{
 #if defined(_FTP_DEBUG_)
-			printf("%d:socket() error:%ld\r\n", CTRL_SOCK_CPM, ret);
+			printf("%d:socket() error:%ld\r\n", (int)CTRL_SOCK_CPM, ret);
 #endif
 			disconnect(CTRL_SOCK_CPM);
 			return ret;
 		}
+		replaceSocketState(CTRL_SOCK_CPM, SOCK_INIT);
 		break;
 
 	case SOCK_INIT:
+	{
 #if defined(_FTP_DEBUG_)
-		printf("%d:Opened\r\n", CTRL_SOCK_CPM);
+		//printf("%d:Opened\r\n", (int)CTRL_SOCK_CPM);
 #endif
 		// strcpy(ftp.workingdir, "/");
+
+		int res = listenSocket(&CTRL_SOCK_CPM, 21);
+		if (res != SOCK_OK)
 		{
-			
-			int iResult = 0;
-			struct addrinfo* result = NULL;
-			struct addrinfo hints;
-			ZeroMemory(&hints, sizeof(hints));
-			hints.ai_family = AF_INET;
-			hints.ai_socktype = SOCK_STREAM;
-			hints.ai_protocol = IPPROTO_TCP;
-			hints.ai_flags = AI_PASSIVE;
-
-			// Resolve the server address and port
-#define DEFAULT_PORT "21"
-			iResult = getaddrinfo(NULL, DEFAULT_PORT, &hints, &result);
-			if (iResult != 0) {
-				printf("getaddrinfo failed with error: %d\n", iResult);
-				WSACleanup();
-				return 1;
-			}
-			// Create a SOCKET for the server to listen for client connections.
-			CTRL_SOCK_CPM = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-			if (CTRL_SOCK_CPM == INVALID_SOCKET)
-			{
-				printf("socket failed with error: %ld\n", WSAGetLastError());
-				freeaddrinfo(result);
-				WSACleanup();
-				return 1;
-			}
-			iResult = bind(CTRL_SOCK_CPM, result->ai_addr, (int)result->ai_addrlen);
-			freeaddrinfo(result);
-			if (iResult != 0 || (ret = listen(CTRL_SOCK_CPM, SOMAXCONN)) != SOCK_OK)
-			{
 #if defined(_FTP_DEBUG_)
-				printf("%d:Listen error\r\n", CTRL_SOCK_CPM);
+			printf("%d:Connect listen error\r\n", (int)CTRL_SOCK_CPM);
 #endif
-				return ret;
-			}
-			SOCKET client = accept(CTRL_SOCK_CPM, NULL, NULL);
-			closesocket(CTRL_SOCK_CPM);
-			replaceSocketState(0, client, SOCK_ESTABLISHED);
-			CTRL_SOCK_CPM = client;
-			connect_state_control = 0;
-
-#if defined(_FTP_DEBUG_)
-			printf("%d:Listen ok\r\n", CTRL_SOCK_CPM);
-#endif
+			return res;
 		}
-		break;
+		connect_state_control = 0;
+
+#if defined(_FTP_DEBUG_)
+		printf("%d:Listen ok\r\n", (int)CTRL_SOCK_CPM);
+#endif
+	}
+	break;
 
 	default:
 		break;
@@ -505,7 +528,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		if (!connect_state_data)
 		{
 #if defined(_FTP_DEBUG_)
-			printf("%d:FTP Data socket Connected\r\n", DATA_SOCK_CPM);
+			printf("%d:FTP Data socket Connected\r\n", (int)DATA_SOCK_CPM);
 #endif
 			connect_state_data = 1;
 		}
@@ -527,6 +550,13 @@ long ftpd_cpm_run(uint8_t* dbuf)
 			while (size > 0)
 			{
 				int sent = send(DATA_SOCK_CPM, pData, size);
+				if (sent < 0)
+				{
+					disconnect(DATA_SOCK_CPM);
+					size = sprintf(dbuf, "226 Failed to transfer\"%s\"\r\n", ftp.workingdir);
+					send(CTRL_SOCK_CPM, dbuf, size);
+					break;
+				}
 				size -= sent;
 				pData += sent;
 			}
@@ -539,7 +569,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		case RETR_CMD:
 		{
 #if defined(_FTP_DEBUG_)
-			printf("filename to retrieve : %s %d\r\n", ftp.filename, strlen(ftp.filename));
+			printf("filename to retrieve : %s %d\r\n", ftp.filename, (int)strlen(ftp.filename));
 #endif
 			mount_drive();
 			strcpy(buf, ftp.filename[0] == '/' ? ftp.filename + 1 : ftp.filename);
@@ -581,7 +611,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		case STOR_CMD:
 		{
 #if defined(_FTP_DEBUG_)
-			printf("filename to store : %s %d\r\n", ftp.filename, strlen(ftp.filename));
+			printf("filename to store : %s %d\r\n", ftp.filename, (int)strlen(ftp.filename));
 #endif
 			mount_drive();
 			char cpmname[2 + 8 + 1 + 3 + 1]; /* 00foobarxy.zzy\0 */
@@ -599,29 +629,34 @@ long ftpd_cpm_run(uint8_t* dbuf)
 				cpmOpen(&ino, &file, O_WRONLY);
 				while (1)
 				{
-					if ((remain_datasize = getSn_RX_RSR(DATA_SOCK_CPM)) > 0)
+					int i = 0;
+					Sleep(100);
+					do
 					{
+						remain_datasize = getSn_RX_RSR(DATA_SOCK_CPM);
+					} while (remain_datasize == 0 && ++i < 100);
+					if (remain_datasize > 0)
+					{
+						char Buffer[20];
+						OutputDebugStringA(itoa(remain_datasize, Buffer, 10));
 						while (1)
 						{
-							int ohno = 0;
-
 							//memset(dbuf, 0, _MAX_SS);
 
 							//if (remain_datasize > _MAX_SS)
 							//	recv_byte = _MAX_SS;
 							//else
-								recv_byte = remain_datasize;
-							int j = recv_byte;
-							j = recv(DATA_SOCK_CPM, dbuf, j, 0); // dbuf, recv_byte);
-							ftp.fr = cpmWrite(&file, dbuf, j) != j ? 1 : 0;						   // f_write(&(ftp.fil), dbuf, (UINT)ret, &blocklen);
+							int received = remain_datasize;
+							received = recv(DATA_SOCK_CPM, dbuf, received, 0);
+							ftp.fr = cpmWrite(&file, dbuf, received) != received ? 1 : 0;
 #if defined(_FTP_DEBUG_)
 							printf("----->fn:%s data:%s \r\n", ftp.filename, dbuf);
 #endif
 
 #if defined(_FTP_DEBUG_)
-							printf("----->dsize:%d recv:%d len:%d \r\n", remain_datasize, ret, blocklen);
+							printf("----->dsize:%d recv:%d len:%d \r\n", remain_datasize, ret, j);
 #endif
-							remain_datasize -= j;
+							remain_datasize -= received;
 
 							if (ftp.fr != FR_OK)
 							{
@@ -649,15 +684,15 @@ long ftpd_cpm_run(uint8_t* dbuf)
 					else
 					{
 						//if (getSn_SR(DATA_SOCK_CPM) != SOCK_ESTABLISHED)
-							break;
+						break;
 					}
 				}
 #if defined(_FTP_DEBUG_)
 				printf("\r\nFile write finished\r\n");
 #endif
 				ftp.fr = cpmClose(&file); // f_close(&(ftp.fil));
-				int nRes =cpmSync(&drive);
-				unmount_drive();
+				int nRes = cpmSync(&drive);
+				//unmount_drive();
 			}
 			else
 			{
@@ -686,7 +721,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		{
 			int i = 0;
 		}
-			break;
+		break;
 		default:
 			break;
 		}
@@ -694,12 +729,12 @@ long ftpd_cpm_run(uint8_t* dbuf)
 
 	case SOCK_CLOSE_WAIT:
 #if defined(_FTP_DEBUG_)
-		printf("%d:CloseWait\r\n", DATA_SOCK_CPM);
+		printf("%d:CloseWait\r\n", (int)DATA_SOCK_CPM);
 #endif
 		if ((ret = disconnect(DATA_SOCK_CPM)) != SOCK_OK)
 			return ret;
 #if defined(_FTP_DEBUG_)
-		printf("%d:Closed\r\n", DATA_SOCK_CPM);
+		printf("%d:Closed\r\n", (int)DATA_SOCK_CPM);
 #endif
 		break;
 
@@ -709,7 +744,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 			if (ftp.dsock_mode == PASSIVE_MODE)
 			{
 #if defined(_FTP_DEBUG_)
-				printf("%d:FTPDataStart, port : %d\r\n", DATA_SOCK_CPM, local_port);
+				printf("%d:FTPDataStart, port : %d\r\n", (int)DATA_SOCK_CPM, local_port);
 #endif
 #if 0
 				if ((DATA_SOCK_CPM = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) != DATA_SOCK_CPM)
@@ -721,7 +756,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 					return ret;
 				}
 #endif
-
+				local_port_old = local_port;
 				local_port++;
 				if (local_port > 50000)
 					local_port = 35000;
@@ -729,66 +764,55 @@ long ftpd_cpm_run(uint8_t* dbuf)
 			else
 			{
 #if defined(_FTP_DEBUG_)
-				printf("%d:FTPDataStart, port : %d\r\n", DATA_SOCK_CPM, IPPORT_FTPD);
+				printf("%d:FTPDataStart, port : %d\r\n", (int)DATA_SOCK_CPM, IPPORT_FTPD);
 #endif
 				if (false && (DATA_SOCK_CPM = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) != DATA_SOCK_CPM)
 				{
 #if defined(_FTP_DEBUG_)
-					printf("%d:socket() error:%ld\r\n", DATA_SOCK_CPM, ret);
+					printf("%d:socket() error:%ld\r\n", (int)DATA_SOCK_CPM, ret);
 #endif
 					disconnect(DATA_SOCK_CPM);
 					return ret;
 				}
 			}
-
+			replaceSocketState(DATA_SOCK_CPM, SOCK_INIT);
 			ftp.dsock_state = DATASOCK_START;
 		}
 		break;
 
 	case SOCK_INIT:
 #if defined(_FTP_DEBUG_)
-		printf("%d:Opened\r\n", DATA_SOCK_CPM);
+		//printf("%d:Opened\r\n", (int)DATA_SOCK_CPM);
 #endif
 		if (ftp.dsock_mode == PASSIVE_MODE)
 		{
 			//int iResult = bind(CTRL_SOCK_CPM, result->ai_addr, (int)result->ai_addrlen);
-			if ((ret = listen(DATA_SOCK_CPM, SOMAXCONN)) != SOCK_OK)
+			if (ftp.dsock_state == DATASOCK_START)
 			{
-#if defined(_FTP_DEBUG_)
-				printf("%d:Listen error\r\n", DATA_SOCK_CPM);
-#endif
-				return ret;
+				ret = listenSocket(&DATA_SOCK_CPM, local_port_old);
+				if (ret != SOCK_OK)
+				{
+	#if defined(_FTP_DEBUG_)
+					printf("%d:Listen error\r\n", (int)DATA_SOCK_CPM);
+	#endif
+					return ret;
+				}
 			}
-			SOCKET client = accept(DATA_SOCK_CPM, NULL, NULL);
-			closesocket(DATA_SOCK_CPM);
-			DATA_SOCK_CPM = client;
-#if defined(_FTP_DEBUG_)
-			printf("%d:Listen ok\r\n", DATA_SOCK_CPM);
-#endif
 		}
 		else
 		{
 			if (remote_ip.lVal == 0)
 			{
-				//replaceSocketState(DATA_SOCK_CPM, DATA_SOCK_CPM, SOCK_INIT);
 				return 0;
 			}
-#if 0
-			struct sockaddr_in addr;
-			RtlZeroMemory(&addr, sizeof addr);
-			addr.sin_family = AF_INET;
-			addr.sin_addr.s_addr = remote_ip.cVal;
-			addr.sin_port = htons(remote_port);
-#endif
-			int iResult = openDataSocket();
-			if (iResult != SOCK_OK)
+			ret = connectSocket(&DATA_SOCK_CPM);
+			if (ret != SOCK_OK)
 			{
 #if defined(_FTP_DEBUG_)
-				printf("%d:Connect error\r\n", DATA_SOCK_CPM);
+				printf("%d:Connect error\r\n", (int)DATA_SOCK_CPM);
 #endif
 				return ret;
 			}
-			replaceSocketState(0, DATA_SOCK_CPM, SOCK_ESTABLISHED);
 		}
 		connect_state_data = 0;
 		break;
@@ -858,8 +882,6 @@ long proc_ftpd_cpm(char* ftp_buf)
 		arg++;
 
 	/* Execute specific command */
-	char cpmname[2 + 8 + 1 + 3 + 1]; /* 00foobarxy.zzy\0 */
-
 	switch (cmdp - commands)
 	{
 	case USER_CMD:
@@ -876,7 +898,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 		if (ret < 0)
 		{
 #if defined(_FTP_DEBUG_)
-			printf("%d:send() error:%ld\r\n", CTRL_SOCK_CPM, ret);
+			printf("%d:send() error:%ld\r\n", (int)CTRL_SOCK_CPM, ret);
 #endif
 			disconnect(CTRL_SOCK_CPM);
 			return ret;
@@ -1016,9 +1038,6 @@ long proc_ftpd_cpm(char* ftp_buf)
 		slen = sprintf(sendbuf, "150 Opening data channel for file upload to server of \"%s\"\r\n", ftp.filename);
 		send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
 		ftp.current_cmd = STOR_CMD;
-		//disconnect(DATA_SOCK_CPM);
-
-		//res = openDataSocket();
 		connect_state_data = 0;
 		break;
 
@@ -1078,7 +1097,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 		break;
 
 	case PASV_CMD:
-		slen = sprintf(sendbuf, "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)\r\n", local_ip.cVal[0], local_ip.cVal[1], local_ip.cVal[2], local_ip.cVal[3], local_port >> 8, local_port & 0x00ff);
+		slen = sprintf(sendbuf, "227 Entering Passive Mode (%d,%d,%d,%d,%d,%d)\r\n", local_ip.cVal[0], local_ip.cVal[1], local_ip.cVal[2], local_ip.cVal[3], /*(int)(signed char)*/ local_port >> 8, /*(int)(signed char)*/(local_port & 0x00ff));
 		send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
 		disconnect(DATA_SOCK_CPM);
 		ftp.dsock_mode = PASSIVE_MODE;
@@ -1188,6 +1207,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 		break;
 
 	case DELE_CMD:
+	{
 		mount_drive();
 		set_fullpath_cpm(arg);
 		char cpmname[2 + 8 + 1 + 3 + 1]; /* 00foobarxy.zzy\0 */
@@ -1201,7 +1221,8 @@ long proc_ftpd_cpm(char* ftp_buf)
 			slen = sprintf(sendbuf, "250 Deleted. \"%s\"\r\n", arg);
 		}
 		int sent = send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
-		break;
+	}
+	break;
 
 	case XCWD_CMD:
 	case ACCT_CMD:
@@ -1286,7 +1307,7 @@ int pport_cpm(char* arg)
 
 void print_filedsc_cpm(FIL* fil)
 {
-#if defined(_FTP_DEBUG_)
+#if 0// defined(_FTP_DEBUG_)
 	printf("File System pointer : %08X\r\n", fil->fs);
 	printf("File System mount ID : %d\r\n", fil->id);
 	printf("File status flag : %08X\r\n", fil->flag);
