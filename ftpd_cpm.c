@@ -462,10 +462,6 @@ long ftpd_cpm_run(uint8_t* dbuf)
 #endif
 			proc_ftpd_cpm((char*)dbuf);
 		}
-		if (size == 0)
-		{
-			int i = 0;
-		}
 		break;
 
 	case SOCK_CLOSE_WAIT:
@@ -553,7 +549,7 @@ long ftpd_cpm_run(uint8_t* dbuf)
 				if (sent < 0)
 				{
 					disconnect(DATA_SOCK_CPM);
-					size = sprintf(dbuf, "226 Failed to transfer\"%s\"\r\n", ftp.workingdir);
+					size = sprintf(dbuf, "550 Failed to transfer\"%s\"\r\n", ftp.workingdir);
 					send(CTRL_SOCK_CPM, dbuf, size);
 					break;
 				}
@@ -637,8 +633,6 @@ long ftpd_cpm_run(uint8_t* dbuf)
 					} while (remain_datasize == 0 && ++i < 100);
 					if (remain_datasize > 0)
 					{
-						char Buffer[20];
-						OutputDebugStringA(itoa(remain_datasize, Buffer, 10));
 						while (1)
 						{
 							//memset(dbuf, 0, _MAX_SS);
@@ -717,11 +711,6 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		break;
 
 		case NO_CMD:
-			//disconnect(DATA_SOCK_CPM);
-		{
-			int i = 0;
-		}
-		break;
 		default:
 			break;
 		}
