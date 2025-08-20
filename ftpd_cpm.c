@@ -36,7 +36,7 @@ static uint16_t local_port_old;
 static uint8_t connect_state_control = 0;
 static uint8_t connect_state_data = 0;
 
-static struct ftpd ftp;
+static struct ftpd ftp = { 0 };
 
 static int current_year = 2014;
 static int current_month = 12;
@@ -45,6 +45,7 @@ static int current_hour = 10;
 static int current_min = 10;
 static int current_sec = 30;
 
+WSAEVENT hEventControlClosed = 0;
 
 typedef int FRESULT;
 #define FR_OK 0
@@ -104,7 +105,7 @@ FRESULT unmount_drive()
 	return FR_OK;
 }
 
-FRESULT scan_files_cpm(char* path, char* buf1, int* buf_len)
+FRESULT scan_files_cpm(char* path, char* buf1, int* buf_len, const char *pattern)
 {
 	mount_drive();
 	int res;
@@ -126,25 +127,35 @@ FRESULT scan_files_cpm(char* path, char* buf1, int* buf_len)
 		char temp_mon[12][4] = { "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" };
 		if (strcmp(dirent.name, ".") == 0 || strcmp(dirent.name, "..") == 0)
 			continue;
+		if (pattern && !match(dirent.name, pattern))
+			continue;
 		get_file_name_cpm(fno.fname, &dirent);
 		++file_cnt;
-		cpmNamei(&root, dirent.name, &file);
-		cpmStat(&file, &statbuf);
-		fno.fsize = statbuf.size;// +bufStat.f_bsize - 1) / bufStat.f_bsize * (bufStat.f_bsize / 1024));
-		temp_dir = '-';
-		fno.fdate = temp_f_date;
-		fno.ftime = temp_f_time;
-		uint8_t h = fno.ftime >> 11;
-		uint8_t m = (fno.ftime >> 5) % 64;
-		int mon = ((fno.fdate >> 5) & 0x0f) - 1;
-		if (mon < 0)
-			mon = 0;
-		WORD date = fno.fdate & 0x1f;
-		if (date == 0)
-			date = 1;
-		int len = sprintf(p_buf, "%crwxr-xr-x 1 ftp ftp %d %s %d %d %d:%.2d %s\r\n", temp_dir, fno.fsize, temp_mon[mon], date, (((fno.fdate >> 9) & 0x7f) + 1980),
-			h, m, fno.fname);
-		p_buf += len;
+		if (ftp.current_cmd != NLST_CMD)
+		{
+			cpmNamei(&root, dirent.name, &file);
+			cpmStat(&file, &statbuf);
+			fno.fsize = statbuf.size;// +bufStat.f_bsize - 1) / bufStat.f_bsize * (bufStat.f_bsize / 1024));
+			temp_dir = '-';
+			fno.fdate = temp_f_date;
+			fno.ftime = temp_f_time;
+			uint8_t h = fno.ftime >> 11;
+			uint8_t m = (fno.ftime >> 5) % 64;
+			int mon = ((fno.fdate >> 5) & 0x0f) - 1;
+			if (mon < 0)
+				mon = 0;
+			WORD date = fno.fdate & 0x1f;
+			if (date == 0)
+				date = 1;
+			int len = sprintf(p_buf, "%crwxr-xr-x 1 ftp ftp %d %s %d %d %d:%.2d %s\r\n", temp_dir, fno.fsize, temp_mon[mon], date, (((fno.fdate >> 9) & 0x7f) + 1980),
+				h, m, fno.fname);
+			p_buf += len;
+		}
+		else
+		{
+			int len = sprintf(p_buf, "%s\r\n", fno.fname);
+			p_buf += len;
+		}
 	}
 	*p_buf = 0;
 	*buf_len = (int)strlen(buf1);
@@ -407,6 +418,11 @@ int listenSocket(SOCKET* ps, uint16_t port)
 	SOCKET client = accept(*ps, NULL, NULL);
 	closesocket(*ps);
 	*ps = client;
+	hEventControlClosed = WSACreateEvent();
+	if (hEventControlClosed == INVALID_HANDLE_VALUE)
+		return -1;
+	if ((iResult=WSAEventSelect(*ps, hEventControlClosed, FD_CLOSE)) != SOCK_OK)
+		return -1;
 	replaceSocketState(*ps, SOCK_ESTABLISHED);
 	return 0;
 }
@@ -418,7 +434,11 @@ long ftpd_cpm_run(uint8_t* dbuf)
 	int32_t remain_datasize;
 
 	// memset(dbuf, 0, sizeof(_MAX_SS));
-
+	if (WSAWaitForMultipleEvents(1, &hEventControlClosed, FALSE, 0, FALSE) == WSA_WAIT_EVENT_0)
+	{
+		if (CTRL_SOCK_CPM != CTRL_SOCK_CLOSED)
+			disconnect(CTRL_SOCK_CPM);
+	}
 	switch (getSn_SR(CTRL_SOCK_CPM))
 	{
 	case SOCK_ESTABLISHED:
@@ -548,10 +568,11 @@ long ftpd_cpm_run(uint8_t* dbuf)
 		{
 		case LIST_CMD:
 		case MLSD_CMD:
+		case NLST_CMD:
 #if defined(_FTP_DEBUG_)
 			printf("previous size: %d\r\n", size);
 #endif
-			scan_files_cpm(ftp.workingdir, dbuf, (int*)&size);
+			scan_files_cpm(ftp.workingdir, dbuf, (int*)&size, strlen(ftp.filename)>0 ? ftp.filename : NULL);
 #if defined(_FTP_DEBUG_)
 			printf("returned size: %d\r\n", size);
 			printf("%s\r\n", dbuf);
@@ -833,7 +854,7 @@ void toCpmName(char cpmname[15], const char* filename)
 {
 	strcpy(cpmname, "00");
 	const char* pDot = strchr(filename, '.');
-	int len = min(8, pDot ? pDot - filename : strlen(filename));
+	int len = min(8, (int)(pDot ? pDot - filename : strlen(filename)));
 	strncpy(cpmname + 2, filename, len);
 	cpmname[2 + len] = 0;
 	if (pDot)
@@ -850,9 +871,17 @@ inline int strlen_i(const char* arg)
 }
 
 
+int getArg(char* arg)
+{
+	int slen = strlen_i(arg);
+	if (slen >= 2)
+		arg[slen - 2] = 0;
+	return slen;
+}
+
 long proc_ftpd_cpm(char* ftp_buf)
 {
-	char** cmdp, * cp, * arg, * tmpstr;
+	char** cmdp, * cp, * arg/*, * tmpstr*/;
 	char sendbuf[200];
 	int slen;
 	long ret;
@@ -901,9 +930,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 #if defined(_FTP_DEBUG_)
 		printf("USER_CMD : %s", arg);
 #endif
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
+		slen = getArg(arg);
 		strcpy(ftp.username, arg);
 		// fsprintf(CTRL_SOCK_CPM, givepass);
 		slen = sprintf(sendbuf, "331 Enter PASS command\r\n");
@@ -922,16 +949,12 @@ long proc_ftpd_cpm(char* ftp_buf)
 #if defined(_FTP_DEBUG_)
 		printf("PASS_CMD : %s", arg);
 #endif
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
+		slen = getArg(arg);
 		ftplogin_cpm(arg);
 		break;
 
 	case TYPE_CMD:
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
+		slen = getArg(arg);
 		switch (arg[0])
 		{
 		case 'A':
@@ -976,9 +999,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 		break;
 
 	case RETR_CMD:
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
+		slen = getArg(arg);
 #if defined(_FTP_DEBUG_)
 		printf("RETR_CMD\r\n");
 #endif
@@ -1038,9 +1059,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 
 	case APPE_CMD:
 	case STOR_CMD:
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
+		slen = getArg(arg);
 #if defined(_FTP_DEBUG_)
 		printf("STOR_CMD\r\n");
 #endif
@@ -1087,6 +1106,8 @@ long proc_ftpd_cpm(char* ftp_buf)
 #if defined(_FTP_DEBUG_)
 		printf("LIST_CMD\r\n");
 #endif
+		getArg(arg);
+		strcpy(ftp.filename, arg);
 		slen = sprintf(sendbuf, "150 Opening data channel for directory listing of \"%s\"\r\n", ftp.workingdir);
 		send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
 		ftp.current_cmd = LIST_CMD;
@@ -1096,6 +1117,11 @@ long proc_ftpd_cpm(char* ftp_buf)
 #if defined(_FTP_DEBUG_)
 		printf("NLST_CMD\r\n");
 #endif
+		getArg(arg);
+		strcpy(ftp.filename, arg);
+		slen = sprintf(sendbuf, "150 Opening data channel for directory listing of \"%s\"\r\n", ftp.workingdir);
+		send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
+		ftp.current_cmd = NLST_CMD;
 		break;
 
 	case SYST_CMD:
@@ -1121,9 +1147,7 @@ long proc_ftpd_cpm(char* ftp_buf)
 		break;
 
 	case SIZE_CMD:
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
+		slen = getArg(arg);
 		if (slen > 3)
 		{
 			//tmpstr = strrchr(arg, '/');
@@ -1148,65 +1172,16 @@ long proc_ftpd_cpm(char* ftp_buf)
 		break;
 
 	case CWD_CMD:
-		slen = strlen_i(arg);
-		arg[slen - 1] = 0x00;
-		arg[slen - 2] = 0x00;
-		if (slen > 3)
+		slen = getArg(arg);
 		{
-			// arg[slen - 3] = 0x00;
-			tmpstr = strrchr(arg, '/');
-			if (!strcmp(arg, ".."))
-			{
-				*arg = 0;
-				tmpstr = strrchr(ftp.workingdir, '/');
-				if (tmpstr)
-					*tmpstr = 0;
-				else
-					strcpy(ftp.workingdir, "/");
-				slen = 0;
-			}
-			else
-			{
-				if (tmpstr == NULL)
-					slen = get_filesize_cpm(ftp.workingdir, arg);
-				else
-					*tmpstr = 0;
-				if (tmpstr != NULL)
-					slen = get_filesize_cpm(arg, tmpstr + 1);
-				if (slen == -1)
-					slen = 0;
-				if (tmpstr)
-					*tmpstr = '/';
-			}
-			if (slen == 0)
-			{
-				slen = sprintf(sendbuf, "213 %d\r\n", slen);
-				// strcpy(ftp.workingdir, arg);
-				if (strcmp(ftp.workingdir, "/") && strlen(ftp.workingdir) != 0)
-				{
-					if (strlen(arg))
-						strcat(ftp.workingdir, "/");
-				}
-				else
-					ftp.workingdir[0] = 0;
-				strcat(ftp.workingdir, arg);
-				slen = sprintf(sendbuf, "250 CWD successful. \"%s\" is current directory.\r\n", ftp.workingdir);
-			}
-			else
-			{
-				slen = sprintf(sendbuf, "550 CWD failed. \"%s\"\r\n", arg);
-			}
-		}
-		else
-		{
-			strcpy(ftp.workingdir, arg);
-			slen = sprintf(sendbuf, "250 CWD successful. \"%s\" is current directory.\r\n", ftp.workingdir);
+			slen = sprintf(sendbuf, "550 CWD failed. \"%s\"\r\n", arg);
 		}
 		send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
 		break;
 
 	case MKD_CMD:
 	case XMKD_CMD:
+		getArg(arg);
 		if (true)
 		{
 			slen = sprintf(sendbuf, "550 Can't create directory. \"%s\"\r\n", arg);
@@ -1253,6 +1228,8 @@ long proc_ftpd_cpm(char* ftp_buf)
 		// fsprintf(CTRL_SOCK_CPM, badcmd, arg);
 		slen = sprintf(sendbuf, "500 Unknown command \'%s\'\r\n", arg);
 		send(CTRL_SOCK_CPM, (uint8_t*)sendbuf, slen);
+		disconnect(CTRL_SOCK_CPM);
+		disconnect(DATA_SOCK_CPM);
 		break;
 	}
 
