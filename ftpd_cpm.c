@@ -72,7 +72,22 @@ FRESULT mount_drive()
 	if ((err = Device_open(&drive.dev, image, O_RDWR, devopts)))
 		return -1;
 	FRESULT res;
-	if ((res = cpmReadSuper(&drive, &root, format)) != FR_OK)
+
+	// 17153 format
+	struct cpmSuperBlock* d = &drive;
+	d->secLength = 1024;
+	d->tracks = 160;
+	d->sectrk = 5;
+	d->blksiz = 2048;
+	d->maxdir = 128;
+	d->skew = 0;
+	d->skewtab = NULL;
+	d->type = 0;
+	d->boottrk = 4;
+	d->extents = 1;
+	d->size = (d->secLength * d->sectrk * (d->tracks - d->boottrk)) / d->blksiz;
+
+	if ((res = cpmReadSuper(&drive, &root, NULL/*format*/)) != FR_OK)
 		return res;
 	bMounted = true;
 	return FR_OK;

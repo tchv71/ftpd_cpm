@@ -972,8 +972,12 @@ int cpmReadSuper(struct cpmSuperBlock *d, struct cpmInode *root, const char *for
   assert(s_ifdir);
   while (s_ifreg && !S_ISREG(s_ifreg)) s_ifreg<<=1;
   assert(s_ifreg);
-  if (strcmp(format,"amstrad")==0) amsReadSuper(d,format);
-  else diskdefReadSuper(d,format);
+  if (format)
+  {
+    if (strcmp(format, "amstrad") == 0) amsReadSuper(d, format);
+    else
+      diskdefReadSuper(d, format);
+  }
   Device_setGeometry(&d->dev,d->secLength,d->sectrk,d->tracks,d->offset);
   if (d->skewtab==(int*)0) /* generate skew table */ /*{{{*/
   {
